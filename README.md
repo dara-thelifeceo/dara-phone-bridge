@@ -1,115 +1,241 @@
-# dara-phone-bridge
+# Dara Phone Bridge
 
-Production Twilio SMS and Vapi relay edge bridge for Dara Public PA.
+Minimal Python stdlib HTTP webhook bridge for Dallas's Dara Public PA phone stack.
 
-Public hostname: `phone.dallasclounch.com`
+## What It Does
 
-This existing Railway service accepts Twilio SMS webhooks, verifies the Twilio request
-signature against `PUBLIC_HOST` plus the exact externally requested path, and
-relays the original `application/x-www-form-urlencoded` body to the existing
-host-side Public PA bridge endpoint. It also accepts authenticated Vapi server
-events, tool calls, and actions, then relays the exact JSON body to the
-matching existing host-side Vapi endpoint. It does not create a new service,
-does not create credentials, and does not handle voice call routing. Voice
-routing stays on Vapi.
+- `POST /twilio/sms`: validates `X-Twilio-Signature`, immediately returns empty TwiML, then asks the local Public PA OpenAI-compatible endpoint for one outbound SMS reply and sends it back through Twilio.
+- `POST /twilio/voice`: validates `X-Twilio-Signature` and returns TwiML that forwards the call to `VOICE_FORWARD_TO` with caller ID `VOICE_CALLER_ID`.
+- `POST /twilio/status`: validates `X-Twilio-Signature`, persists delivery status metadata, and logs status metadata only.
+- `POST /vapi/events`: validates `x-vapi-secret` or `Authorization: Bearer ...`, deduplicates Vapi events by call ID and event type, immediately returns `204`, then asynchronously forwards safe end-of-call report fields to Public PA.
+- `POST /vapi/tools` and `POST /vapi/actions`: validate `x-vapi-secret` or `Authorization: Bearer ...`, parse Vapi tool-call envelope variants, synchronously delegate calendar actions to Public PA, and return Vapi-compatible tool results.
+- `GET /` and `HEAD /`: return a minimal service status.
+- `GET /health`: returns JSON booleans for required settings and never returns secret values.
 
-## Endpoints
+The bridge prevents open relay behavior: only validated inbound Twilio webhooks trigger replies, replies always go to the request `From`, and Twilio sends from the request `To`.
 
-- `GET /` and `HEAD /` status page
-- `GET /health` and `HEAD /health` health check
-- `POST /twilio/sms` canonical Twilio inbound SMS webhook
-- `POST /sms` legacy inbound SMS webhook
-- `POST /twilio/status` Twilio SMS status callback
-- `POST /vapi/events` authenticated Vapi server event relay
-- `POST /vapi/tools` authenticated synchronous Vapi tool relay
-- `POST /vapi/actions` authenticated synchronous Vapi action relay
+Inbound SMS `MessageSid` values are stored in SQLite for idempotency. If Twilio retries the same inbound message, the bridge returns the same empty TwiML response without queueing another Public PA call or outbound reply. Vapi action IDs are also stored durably; duplicate action delivery returns the original stored tool result without calling Public PA again. The SQLite state keeps the most recent 12 inbound/outbound SMS turns per peer, prunes SMS turns older than 30 days, stores call context, stores scheduled follow-up jobs, and records correlations between inbound message SID, Vapi call/action IDs, Twilio provider SID/status, and Google Calendar event ID when Public PA returns one.
 
-## Environment
+Message bodies are stored only in the local SQLite conversation state. They are never written to stdout, journald, or audit JSONL records. Vapi transcripts and recording URLs are not persisted or forwarded.
 
-- `TWILIO_AUTH_TOKEN` Twilio auth token used for Twilio signature validation;
-  also used as a compatibility fallback Vapi webhook secret when
-  `VAPI_WEBHOOK_SECRET` is absent
-- `TWILIO_ACCOUNT_SID` Twilio account SID; reported as configured/not configured
-- `PUBLIC_HOST` public webhook base, default `https://phone.dallasclounch.com`
-- `RELAY_URL` existing OS-managed Public PA bridge endpoint for inbound SMS
-- `RELAY_STATUS_URL` optional existing OS-managed Public PA bridge endpoint for SMS status callbacks
-- `VAPI_WEBHOOK_SECRET` shared Vapi event webhook secret
-- `VAPI_RELAY_URL` existing OS-managed Public PA bridge endpoint for Vapi events,
-  tools, or actions
-- `VAPI_RELAY_TIMEOUT_SECONDS` optional synchronous Vapi JSON relay timeout,
-  default `85`; keep below Vapi's 90-second tool server timeout
-- `PORT` provided by Railway, default `8080`
+## Configuration
 
-`/health` reports booleans for Twilio, SMS relay, and Vapi events/tools/actions
-relay configuration. It never returns secret or URL values and does not claim
-Public PA relay configuration when relay variables are absent.
+Environment variables:
 
-Compatibility fallback: if `VAPI_WEBHOOK_SECRET` is absent, Vapi auth uses
-`TWILIO_AUTH_TOKEN` as the shared secret. If `VAPI_RELAY_URL` is absent, the
-Vapi relay URL is derived from `RELAY_URL` by replacing a trailing `/twilio/sms`
-or `/sms` path with the requested Vapi path, such as `/vapi/events`,
-`/vapi/tools`, or `/vapi/actions`. If `VAPI_RELAY_URL` is set to one Vapi path,
-the existing service derives the matching sibling Vapi path for the current
-request. The dedicated `VAPI_WEBHOOK_SECRET` and `VAPI_RELAY_URL` variables
-remain preferred and should be set when Railway variable management is
-available.
+```sh
+PUBLIC_BASE_URL=https://phone.dallasclounch.com
+PUBLICPA_ENDPOINT=https://your-isolated-public-pa.example/v1/chat/completions
+VOICE_FORWARD_TO=+155****0102
+VOICE_CALLER_ID=+155****0103
+HOST=0.0.0.0
+PORT=8080
+LOG_LEVEL=INFO
+AUDIT_LOG_PATH=/var/lib/dara-phone-bridge/audit.jsonl
+STATE_DB_PATH=/var/lib/dara-phone-bridge/state.sqlite3
+PUBLICPA_TIMEOUT_SECONDS=60
+VAPI_PUBLICPA_ACTION_BUDGET_SECONDS=82
+VAPI_WEBHOOK_SECRET=change-me
+```
 
-## Twilio URLs
+Defaults:
 
-Set SMS for `+1 (480) 771-7495` to:
+- `PUBLICPA_ENDPOINT`: `http://127.0.0.1:8644/v1/chat/completions`
+- `PUBLICPA_ENV_PATH`: `/home/dara-public/.hermes/profiles/publicpa/.env`
+- `TWILIO_ENV_PATH`: `/root/.hermes/.env`
+- `HOST`: `0.0.0.0`
+- `PORT`: `8080`
+- `AUDIT_LOG_PATH`: unset
+- `STATE_DB_PATH`: `/var/lib/dara-phone-bridge/state.sqlite3`
+- `PUBLICPA_TIMEOUT_SECONDS`: `60`
+- `VAPI_PUBLICPA_ACTION_BUDGET_SECONDS`: `82`, capped at `88`
 
-`https://phone.dallasclounch.com/twilio/sms`
+Required secrets:
 
-Set SMS status callback to:
+- `API_SERVER_KEY` in `PUBLICPA_ENV_PATH`, or in the process environment.
+- `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` in `TWILIO_ENV_PATH`, or in the process environment.
+- `VAPI_WEBHOOK_SECRET` if `POST /vapi/events` is enabled in Vapi. If it is unset, the already configured `TWILIO_AUTH_TOKEN` is used as the effective Vapi webhook secret for compatibility.
 
-`https://phone.dallasclounch.com/twilio/status`
+Required voice routing:
 
-Leave voice on Vapi:
+- `VOICE_FORWARD_TO`: destination phone number in E.164 format, for example `+15555550102`.
+- `VOICE_CALLER_ID`: verified Twilio caller ID in E.164 format, for example `+15555550103`.
 
-- Voice webhook: `https://api.vapi.ai/twilio/inbound_call`
-- Voice status callback: `https://api.vapi.ai/twilio/status`
+If either voice routing value is missing, `POST /twilio/voice` returns HTTP 503 with safe TwiML instead of returning a malformed `<Dial>`.
 
-## Vapi URL
+`PUBLIC_BASE_URL` must exactly match the public URL Twilio uses before the webhook path. For this deployment it is `https://phone.dallasclounch.com`.
 
-Set the Vapi server event webhook to:
+When `AUDIT_LOG_PATH` is set, structured events are appended as JSON Lines to that file. Audit records omit message bodies and secrets and mask full phone numbers. The bridge creates the configured file's parent directory if needed, uses a thread lock for writes, and logs audit write failures without failing Twilio webhook handling.
 
-`https://phone.dallasclounch.com/vapi/events`
+`STATE_DB_PATH` stores inbound SMS idempotency, bounded SMS conversation history, Twilio status metadata, and Vapi event dedupe state. The bridge creates the parent directory if needed and sets the SQLite file mode to `0600`.
 
-Set Vapi tool and action endpoints to the existing Railway service as needed:
+Public PA calls use `PUBLICPA_TIMEOUT_SECONDS`. Vapi synchronous calendar actions use `VAPI_PUBLICPA_ACTION_BUDGET_SECONDS` as the total Public PA retry lifetime; each HTTP attempt is capped to the remaining budget so the bridge can return before Vapi's 90 second tool timeout. Outbound SMS replies are truncated to 1500 characters before submission to Twilio.
 
-- `https://phone.dallasclounch.com/vapi/tools`
-- `https://phone.dallasclounch.com/vapi/actions`
+Public PA and Twilio outbound calls use bounded exponential retries for transient failures (`408`, `409`, `429`, `5xx`, URL/network timeout errors). Calendar availability and booking logic is never performed by this bridge; the bridge prompts the configured OpenAI-compatible Public PA endpoint to use Google Calendar and return concise speech-safe responses.
 
-Send the shared secret as either `x-vapi-secret` or `Authorization: Bearer ...`.
+## Run
 
-## Behavior
+```sh
+python3 dara_phone_bridge.py
+```
 
-- Invalid Twilio signatures return `403`.
-- Successful SMS requests return the relay response status, TwiML body, and content type.
-- SMS relay failures return a safe `502` so Twilio can retry.
-- Successful status callbacks return `204`.
-- Vapi event, tool, and action requests use the same shared secret, require
-  valid JSON, and are capped at 2 MiB.
-- Normal accepted async Vapi events return `204` after the host relay accepts
-  the event.
-- Vapi `/vapi/events` tool-calls envelopes preserve a non-empty host JSON
-  response instead of forcing `204`.
-- Vapi `/vapi/tools` and `/vapi/actions` relay synchronously and return the
-  exact host JSON status, body, and content type to Vapi.
-- Synchronous Vapi JSON relays use `VAPI_RELAY_TIMEOUT_SECONDS`; Twilio SMS and
-  async Vapi event relays keep the 8-second relay timeout.
-- Vapi host relay uses bounded transient retries with exponential backoff.
-- Vapi relay timeouts are not retried after the configured timeout budget is
-  consumed; quick transient HTTP 408/429/5xx errors and immediate connection
-  failures may still retry within the bounded retry policy.
-- Vapi auth, validation, and relay failures return safe `4xx` or `5xx` JSON errors.
-- Logs are structured JSON and avoid request bodies, headers, secrets, message
-  content, transcripts, phone numbers, and recording URLs. Vapi relay logs
-  include redacted correlation fields for call ID and tool call IDs only.
+With explicit settings:
+
+```sh
+PUBLIC_BASE_URL=https://phone.dallasclounch.com VOICE_FORWARD_TO=+155****0102 VOICE_CALLER_ID=+155****0103 HOST=0.0.0.0 PORT=8080 python3 dara_phone_bridge.py
+```
 
 ## Test
 
 ```sh
-python -m unittest discover -v
-python -m py_compile server.py tests/test_server.py
+python3 -m unittest discover -s tests
 ```
+
+Tests use only stdlib modules and do not make network calls to Twilio or Public PA.
+
+## Railway deployment
+
+The checked-in `Dockerfile`, `.dockerignore`, and `railway.json` make this repository directly deployable as a **new Railway service**. Do not attach it to or modify Railway Pulse or the existing `dallasclounch-com` service.
+
+Set these variables on the new service (secret values belong only in Railway, never in Git):
+
+- `PUBLIC_BASE_URL=https://phone.dallasclounch.com`
+- `PUBLICPA_ENDPOINT`: HTTPS OpenAI-compatible endpoint for the isolated Public PA service
+- `API_SERVER_KEY`: bearer key for that isolated endpoint
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_AUTH_TOKEN`
+- `VOICE_FORWARD_TO` and `VOICE_CALLER_ID` only if voice forwarding is enabled
+- `STATE_DB_PATH=/var/lib/dara-phone-bridge/state.sqlite3`
+- `PUBLICPA_TIMEOUT_SECONDS=60`
+- `VAPI_PUBLICPA_ACTION_BUDGET_SECONDS=82`
+- `VAPI_WEBHOOK_SECRET` if Vapi server events are configured. When absent, `TWILIO_AUTH_TOKEN` is the effective Vapi webhook secret.
+
+Railway supplies `PORT`; the service listens on `0.0.0.0`. The configured health check is `/health`. After the first successful deployment, add `phone.dallasclounch.com` as the new service's custom domain and create the DNS record Railway displays. Do not point DNS at another service.
+
+`PUBLICPA_ENV_PATH` and `TWILIO_ENV_PATH` are host-service compatibility options. On Railway, inject the corresponding secret variables directly instead of relying on files.
+
+## Twilio Webhooks
+
+Configure Twilio to send:
+
+- Incoming SMS webhook: `POST https://phone.dallasclounch.com/twilio/sms`
+- Incoming voice webhook: `POST https://phone.dallasclounch.com/twilio/voice`
+- Message or call status callback: `POST https://phone.dallasclounch.com/twilio/status`
+
+## Vapi Webhook
+
+Configure Vapi server events to send:
+
+- Server events webhook: `POST https://phone.dallasclounch.com/vapi/events`
+- Tool/action endpoint: `POST https://phone.dallasclounch.com/vapi/tools` (or `/vapi/actions`)
+- Authentication: either `x-vapi-secret: $VAPI_WEBHOOK_SECRET` or `Authorization: Bearer $VAPI_WEBHOOK_SECRET`. If `VAPI_WEBHOOK_SECRET` is unset, use the configured `TWILIO_AUTH_TOKEN` value instead.
+
+The endpoint accepts only valid JSON up to 256 KiB. It deduplicates by call ID plus event type and processes only `end-of-call-report` asynchronously. Public PA receives only safe structured fields: call ID/type/status/endedReason, summary, structuredData, customer phone, and assistantOverrides when present.
+
+### Vapi Tool Contract
+
+The synchronous action endpoint accepts common Vapi envelopes including:
+
+- Top-level `toolCalls`, `toolCallList`, `toolCall`, `functionCall`, or `action`
+- Nested `message.toolCalls`, `message.toolCallList`, `message.functionCall`, or `message.action`
+- Tool IDs from `id`, `toolCallId`, `tool_call_id`, or nested action/function IDs
+- Tool names from `name`, `toolName`, `tool_name`, or nested `function.name` / `action.name`
+- Arguments as JSON objects or JSON strings from `arguments`, `parameters`, or `input`
+
+Supported tool names and aliases:
+
+- `check_availability`, `checkAvailability`, `availability`
+- `create_booking`, `createBooking`, `book`
+- `reschedule_booking`, `rescheduleBooking`, `reschedule`
+- `cancel_booking`, `cancelBooking`, `cancel`
+- `read_back`, `readBack`, `readback`
+
+Response:
+
+```json
+{
+  "results": [
+    {
+      "toolCallId": "tool-call-id-from-vapi",
+      "result": "Concise speech-safe sentence for the caller.",
+      "success": true,
+      "calendar_event_id": "optional-google-calendar-event-id"
+    }
+  ]
+}
+```
+
+Duplicate `toolCallId` values return the stored JSON result. Unknown tools return a Vapi-compatible failed result and are persisted for idempotency.
+
+## systemd Example
+
+Create `/etc/systemd/system/dara-phone-bridge.service`:
+
+```ini
+[Unit]
+Description=Dara Phone Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dara-public
+Group=dara-public
+WorkingDirectory=/opt/dara-phone-bridge
+Environment=PUBLIC_BASE_URL=https://phone.example.com
+Environment=VOICE_FORWARD_TO=+15555550102
+Environment=VOICE_CALLER_ID=+15555550103
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+Environment=AUDIT_LOG_PATH=/var/lib/dara-phone-bridge/audit.jsonl
+Environment=STATE_DB_PATH=/var/lib/dara-phone-bridge/state.sqlite3
+Environment=PUBLICPA_TIMEOUT_SECONDS=60
+ExecStart=/usr/bin/python3 /opt/dara-phone-bridge/dara_phone_bridge.py
+Restart=always
+RestartSec=3
+StateDirectory=dara-phone-bridge
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now dara-phone-bridge
+sudo journalctl -u dara-phone-bridge -f
+```
+
+## nginx Example
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name phone.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/phone.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/phone.example.com/privkey.pem;
+
+    location /twilio/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 30s;
+    }
+
+    location /vapi/events {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 30s;
+    }
+
+    location /health {
+        proxy_pass http://127.0.0.1:8080;
+    }
+}
+```
+
+Keep `PUBLIC_BASE_URL` aligned with the externally visible nginx URL.

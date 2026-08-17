@@ -1,2 +1,2 @@
-Last checkpoint: production Railway edge bridge implements secure SMS relay, status callbacks, structured audit logs, HEAD/health, and passing tests.
-Next: configure Railway variables, deploy, wire Twilio, and run end-to-end tests.
+Last checkpoint: the complete deployed phone bridge improvements, documentation, and stable latency regression test are committed locally; all 56 tests pass.
+Next: publish host-bridge-production to GitHub and verify the remote branch head.
