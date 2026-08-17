@@ -16,6 +16,10 @@ from unittest import mock
 AUTH_TOKEN = "test_auth_token"
 ACCOUNT_SID = "ACtestaccount"
 PUBLIC_HOST = "https://phone.dallasclounch.com"
+VAPI_SECRET = "test_vapi_secret"
+VAPI_RELAY_URL = "https://public-pa.example/vapi/events"
+VAPI_TOOLS_URL = "https://public-pa.example/vapi/tools"
+VAPI_ACTIONS_URL = "https://public-pa.example/vapi/actions"
 
 
 class FakeSocket:
@@ -95,6 +99,7 @@ class BridgeTestCase(unittest.TestCase):
                     "url": req.full_url,
                     "body": req.data,
                     "signature": req.get_header("X-twilio-signature"),
+                    "vapi_secret": req.get_header("X-vapi-secret"),
                     "content_type": req.get_header("Content-type"),
                     "timeout": timeout,
                 }
@@ -116,9 +121,40 @@ class BridgeTestCase(unittest.TestCase):
         finally:
             patcher.stop()
 
+    @contextlib.contextmanager
+    def relay_sequence(self, outcomes):
+        requests = []
+        remaining = list(outcomes)
+
+        def fake_urlopen(req, timeout):
+            requests.append(
+                {
+                    "url": req.full_url,
+                    "body": req.data,
+                    "vapi_secret": req.get_header("X-vapi-secret"),
+                    "content_type": req.get_header("Content-type"),
+                    "timeout": timeout,
+                }
+            )
+            outcome = remaining.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return FakeRelayResponse(
+                status=outcome.get("status", 200),
+                body=outcome.get("body", b""),
+                content_type=outcome.get("content_type", "application/json"),
+            )
+
+        patcher = mock.patch("urllib.request.urlopen", side_effect=fake_urlopen)
+        patcher.start()
+        try:
+            yield requests
+        finally:
+            patcher.stop()
+
     def request(self, method, path, body=b"", headers=None):
         headers = dict(headers or {})
-        if body:
+        if body and "Content-Length" not in headers:
             headers["Content-Length"] = str(len(body))
         raw_headers = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
         raw_request = f"{method} {path} HTTP/1.1\r\nHost: test.local\r\n{raw_headers}\r\n".encode("iso-8859-1") + body
@@ -157,7 +193,8 @@ class HealthAndRootTests(BridgeTestCase):
 
     def test_health_reports_configuration_booleans_without_values(self):
         with mock.patch.dict(os.environ, {"RELAY_URL": "", "RELAY_STATUS_URL": ""}, clear=False):
-            response, data = self.request("GET", "/health")
+            with mock.patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": "", "VAPI_RELAY_URL": ""}, clear=False):
+                response, data = self.request("GET", "/health")
 
         self.assertEqual(response.status, 200)
         payload = json.loads(data)
@@ -165,9 +202,37 @@ class HealthAndRootTests(BridgeTestCase):
         self.assertIs(payload["twilio_account_configured"], True)
         self.assertIs(payload["relay_configured"], False)
         self.assertIs(payload["relay_status_configured"], False)
+        self.assertIs(payload["vapi_webhook_secret_configured"], True)
+        self.assertIs(payload["vapi_relay_configured"], False)
+        self.assertIs(payload["vapi_events_relay_configured"], False)
+        self.assertIs(payload["vapi_tools_relay_configured"], False)
+        self.assertIs(payload["vapi_actions_relay_configured"], False)
         serialized = json.dumps(payload)
         self.assertNotIn(AUTH_TOKEN, serialized)
         self.assertNotIn(ACCOUNT_SID, serialized)
+
+    def test_health_reports_effective_vapi_fallback_configuration(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VAPI_WEBHOOK_SECRET": "",
+                "VAPI_RELAY_URL": "",
+                "RELAY_URL": "https://public-pa.example/twilio/sms",
+            },
+            clear=False,
+        ):
+            response, data = self.request("GET", "/health")
+
+        self.assertEqual(response.status, 200)
+        payload = json.loads(data)
+        self.assertIs(payload["vapi_webhook_secret_configured"], True)
+        self.assertIs(payload["vapi_relay_configured"], True)
+        self.assertIs(payload["vapi_events_relay_configured"], True)
+        self.assertIs(payload["vapi_tools_relay_configured"], True)
+        self.assertIs(payload["vapi_actions_relay_configured"], True)
+        serialized = json.dumps(payload)
+        self.assertNotIn(AUTH_TOKEN, serialized)
+        self.assertNotIn("public-pa.example", serialized)
 
 
 class SmsBridgeTests(BridgeTestCase):
@@ -175,8 +240,8 @@ class SmsBridgeTests(BridgeTestCase):
         params = {
             "AccountSid": ACCOUNT_SID,
             "MessageSid": "SM123",
-            "From": "+148****0123",
-            "To": "+148****7495",
+            "From": "+14805550123",
+            "To": "+14807717495",
             "Body": "hello Dara",
             "NumMedia": "0",
         }
@@ -208,7 +273,7 @@ class SmsBridgeTests(BridgeTestCase):
         self.assertNotIn("hello Dara", "\n".join(json.dumps(event) for event in events))
 
     def test_legacy_sms_path_still_validates_against_legacy_url(self):
-        params = {"AccountSid": ACCOUNT_SID, "MessageSid": "SMlegacy", "From": "+148****0123", "To": "+148****7495"}
+        params = {"AccountSid": ACCOUNT_SID, "MessageSid": "SMlegacy", "From": "+14805550123", "To": "+14807717495"}
         body = self.form_body(params)
         with self.relay_mock() as relay_requests:
             with mock.patch.dict(os.environ, {"RELAY_URL": "https://public-pa.example/sms"}, clear=False):
@@ -225,7 +290,7 @@ class SmsBridgeTests(BridgeTestCase):
         self.assertEqual(len(relay_requests), 1)
 
     def test_signature_must_match_exact_external_path(self):
-        params = {"AccountSid": ACCOUNT_SID, "MessageSid": "SMbadpath", "From": "+148****0123", "To": "+148****7495"}
+        params = {"AccountSid": ACCOUNT_SID, "MessageSid": "SMbadpath", "From": "+14805550123", "To": "+14807717495"}
         response, data = self.request(
             "POST",
             "/twilio/sms",
@@ -239,7 +304,7 @@ class SmsBridgeTests(BridgeTestCase):
         self.assertIn(b"invalid_signature", data)
 
     def test_sms_relay_failure_returns_safe_502_and_logs_metadata(self):
-        params = {"AccountSid": ACCOUNT_SID, "MessageSid": "SMfail", "From": "+148****0123", "To": "+148****7495"}
+        params = {"AccountSid": ACCOUNT_SID, "MessageSid": "SMfail", "From": "+14805550123", "To": "+14807717495"}
         body = self.form_body(params)
         error = urllib.error.HTTPError("https://public-pa.example/sms", 503, "unavailable", {}, io.BytesIO(b"secret downstream body"))
         with self.relay_mock(error=error):
@@ -267,8 +332,8 @@ class StatusCallbackTests(BridgeTestCase):
             "MessageSid": "SMstatus",
             "SmsStatus": "delivered",
             "ErrorCode": "",
-            "From": "+148****0123",
-            "To": "+148****7495",
+            "From": "+14805550123",
+            "To": "+14807717495",
         }
         body = self.form_body(params)
         with self.relay_mock(status=204, body=b"") as relay_requests:
@@ -307,3 +372,327 @@ class StatusCallbackTests(BridgeTestCase):
             },
         )
         self.assertEqual(response.status, 403)
+
+
+class VapiEventTests(BridgeTestCase):
+    def vapi_body(self):
+        return json.dumps(
+            {
+                "type": "transcript",
+                "phoneNumber": "+14805550123",
+                "message": {"content": "sensitive transcript"},
+                "recordingUrl": "https://recordings.example/private.wav",
+            }
+        ).encode("utf-8")
+
+    def vapi_env(self):
+        return mock.patch.dict(
+            os.environ,
+            {"VAPI_WEBHOOK_SECRET": VAPI_SECRET, "VAPI_RELAY_URL": VAPI_RELAY_URL},
+            clear=False,
+        )
+
+    def test_vapi_missing_effective_secret_returns_503_without_relay(self):
+        with self.vapi_env(), self.relay_mock() as relay_requests:
+            with mock.patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": "", "TWILIO_AUTH_TOKEN": ""}, clear=False):
+                response, data = self.request(
+                    "POST",
+                    "/vapi/events",
+                    b'{"type":"event"}',
+                    {"Content-Type": "application/json"},
+                )
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(data, b'{"error":"vapi_not_configured"}')
+        self.assertEqual(relay_requests, [])
+
+    def test_vapi_missing_header_returns_403_without_relay(self):
+        with self.vapi_env(), self.relay_mock() as relay_requests:
+            response, data = self.request(
+                "POST",
+                "/vapi/events",
+                b'{"type":"event"}',
+                {"Content-Type": "application/json"},
+            )
+
+        self.assertEqual(response.status, 403)
+        self.assertEqual(data, b'{"error":"forbidden"}')
+        self.assertEqual(relay_requests, [])
+
+    def test_vapi_invalid_secret_returns_403_without_relay(self):
+        with self.vapi_env(), self.relay_mock() as relay_requests:
+            response, _ = self.request(
+                "POST",
+                "/vapi/events",
+                b'{"type":"event"}',
+                {"Content-Type": "application/json", "x-vapi-secret": "wrong"},
+            )
+
+        self.assertEqual(response.status, 403)
+        self.assertEqual(relay_requests, [])
+
+    def test_vapi_valid_x_vapi_secret_relays_exact_json_and_returns_204(self):
+        body = self.vapi_body()
+        with self.vapi_env(), self.relay_mock(status=202, body=b"accepted", content_type="application/json") as relay_requests:
+            response, data = self.request(
+                "POST",
+                "/vapi/events",
+                body,
+                {"Content-Type": "application/json", "x-vapi-secret": VAPI_SECRET},
+            )
+
+        self.assertEqual(response.status, 204)
+        self.assertEqual(data, b"")
+        self.assertEqual(len(relay_requests), 1)
+        self.assertEqual(relay_requests[0]["url"], VAPI_RELAY_URL)
+        self.assertEqual(relay_requests[0]["body"], body)
+        self.assertEqual(relay_requests[0]["content_type"], "application/json")
+        self.assertEqual(relay_requests[0]["vapi_secret"], VAPI_SECRET)
+        self.assertLessEqual(relay_requests[0]["timeout"], 10)
+
+    def test_vapi_tools_returns_exact_host_json_status_body_content_type(self):
+        body = json.dumps(
+            {
+                "call": {"id": "call_123"},
+                "toolCalls": [{"id": "tool_1"}, {"id": "tool_2"}],
+                "input": {"secret_text": "do not log"},
+            }
+        ).encode("utf-8")
+        host_body = b'{"results":[{"toolCallId":"tool_1","result":"ok"}]}'
+        with self.vapi_env(), self.relay_mock(status=201, body=host_body, content_type="application/json; charset=utf-8") as relay_requests:
+            response, data = self.request(
+                "POST",
+                "/vapi/tools",
+                body,
+                {"Content-Type": "application/json", "x-vapi-secret": VAPI_SECRET},
+            )
+
+        self.assertEqual(response.status, 201)
+        self.assertEqual(response.getheader("Content-Type"), "application/json; charset=utf-8")
+        self.assertEqual(data, host_body)
+        self.assertEqual(len(relay_requests), 1)
+        self.assertEqual(relay_requests[0]["url"], VAPI_TOOLS_URL)
+        self.assertEqual(relay_requests[0]["body"], body)
+        self.assertEqual(relay_requests[0]["vapi_secret"], VAPI_SECRET)
+        events = self.assert_json_logs("vapi_relay_started", "vapi_relayed")
+        started = next(event for event in events if event["event"] == "vapi_relay_started")
+        self.assertEqual(started["endpoint"], "/vapi/tools")
+        self.assertEqual(started["call_id"], "call_123")
+        self.assertEqual(started["tool_call_ids"], ["tool_1", "tool_2"])
+        log_text = self.stderr.getvalue()
+        self.assertNotIn("do not log", log_text)
+        self.assertNotIn(VAPI_SECRET, log_text)
+
+    def test_vapi_actions_derives_matching_host_url_from_sms_relay_url(self):
+        body = b'{"callId":"call_action","toolCall":{"id":"tool_action"}}'
+        host_body = b'{"ok":true}'
+        with self.relay_mock(status=200, body=host_body, content_type="application/json") as relay_requests:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "VAPI_WEBHOOK_SECRET": "",
+                    "VAPI_RELAY_URL": "",
+                    "RELAY_URL": "https://public-pa.example/webhooks/twilio/sms",
+                },
+                clear=False,
+            ):
+                response, data = self.request(
+                    "POST",
+                    "/vapi/actions",
+                    body,
+                    {"Content-Type": "application/json", "Authorization": f"Bearer {AUTH_TOKEN}"},
+                )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(data, host_body)
+        self.assertEqual(len(relay_requests), 1)
+        self.assertEqual(relay_requests[0]["url"], "https://public-pa.example/webhooks/vapi/actions")
+        self.assertEqual(relay_requests[0]["vapi_secret"], AUTH_TOKEN)
+
+    def test_vapi_sync_host_http_error_status_and_json_body_are_passthrough(self):
+        body = b'{"call":{"id":"call_bad"},"toolCalls":[{"id":"tool_bad"}]}'
+        headers = {"Content-Type": "application/json"}
+        error = urllib.error.HTTPError(VAPI_TOOLS_URL, 422, "unprocessable", headers, io.BytesIO(b'{"error":"bad_tool"}'))
+        with self.vapi_env(), self.relay_mock(error=error):
+            response, data = self.request(
+                "POST",
+                "/vapi/tools",
+                body,
+                {"Content-Type": "application/json", "x-vapi-secret": VAPI_SECRET},
+            )
+
+        self.assertEqual(response.status, 422)
+        self.assertEqual(response.getheader("Content-Type"), "application/json")
+        self.assertEqual(data, b'{"error":"bad_tool"}')
+
+    def test_vapi_events_tool_calls_preserves_non_empty_host_json_response(self):
+        body = b'{"message":{"type":"tool-calls","call":{"id":"call_evt"},"toolCalls":[{"id":"tool_evt"}]}}'
+        host_body = b'{"toolCallId":"tool_evt","result":"ok"}'
+        with self.vapi_env(), self.relay_mock(status=200, body=host_body, content_type="application/json") as relay_requests:
+            response, data = self.request(
+                "POST",
+                "/vapi/events",
+                body,
+                {"Content-Type": "application/json", "x-vapi-secret": VAPI_SECRET},
+            )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Content-Type"), "application/json")
+        self.assertEqual(data, host_body)
+        self.assertEqual(relay_requests[0]["url"], VAPI_RELAY_URL)
+
+    def test_vapi_events_normal_async_still_returns_204_when_host_has_body(self):
+        body = b'{"type":"transcript","call":{"id":"call_async"}}'
+        with self.vapi_env(), self.relay_mock(status=200, body=b'{"accepted":true}', content_type="application/json"):
+            response, data = self.request(
+                "POST",
+                "/vapi/events",
+                body,
+                {"Content-Type": "application/json", "x-vapi-secret": VAPI_SECRET},
+            )
+
+        self.assertEqual(response.status, 204)
+        self.assertEqual(data, b"")
+
+    def test_vapi_host_relay_retries_transient_errors_then_succeeds(self):
+        body = b'{"call":{"id":"call_retry"},"toolCalls":[{"id":"tool_retry"}]}'
+        with self.vapi_env(), self.relay_sequence(
+            [
+                urllib.error.URLError("temporary outage"),
+                {"status": 200, "body": b'{"ok":true}', "content_type": "application/json"},
+            ]
+        ) as relay_requests:
+            with mock.patch("time.sleep") as sleep_mock:
+                response, data = self.request(
+                    "POST",
+                    "/vapi/tools",
+                    body,
+                    {"Content-Type": "application/json", "x-vapi-secret": VAPI_SECRET},
+                )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(data, b'{"ok":true}')
+        self.assertEqual(len(relay_requests), 2)
+        sleep_mock.assert_called_once_with(0.2)
+        events = self.assert_json_logs("vapi_relay_retry", "vapi_relayed")
+        retry = next(event for event in events if event["event"] == "vapi_relay_retry")
+        self.assertEqual(retry["call_id"], "call_retry")
+        self.assertEqual(retry["tool_call_ids"], ["tool_retry"])
+
+    def test_vapi_valid_bearer_secret_relays(self):
+        with self.vapi_env(), self.relay_mock(status=204) as relay_requests:
+            response, _ = self.request(
+                "POST",
+                "/vapi/events",
+                b'{"type":"event"}',
+                {"Content-Type": "application/json", "Authorization": f"Bearer {VAPI_SECRET}"},
+            )
+
+        self.assertEqual(response.status, 204)
+        self.assertEqual(len(relay_requests), 1)
+
+    def test_vapi_falls_back_to_twilio_token_and_derived_relay_url(self):
+        body = self.vapi_body()
+        with self.relay_mock(status=204) as relay_requests:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "VAPI_WEBHOOK_SECRET": "",
+                    "VAPI_RELAY_URL": "",
+                    "RELAY_URL": "https://public-pa.example/sms",
+                },
+                clear=False,
+            ):
+                response, data = self.request(
+                    "POST",
+                    "/vapi/events",
+                    body,
+                    {"Content-Type": "application/json", "x-vapi-secret": AUTH_TOKEN},
+                )
+
+        self.assertEqual(response.status, 204)
+        self.assertEqual(data, b"")
+        self.assertEqual(len(relay_requests), 1)
+        self.assertEqual(relay_requests[0]["url"], "https://public-pa.example/vapi/events")
+        self.assertEqual(relay_requests[0]["body"], body)
+        self.assertEqual(relay_requests[0]["vapi_secret"], AUTH_TOKEN)
+        self.assertNotIn(AUTH_TOKEN, self.stderr.getvalue())
+
+    def test_vapi_derives_relay_url_from_twilio_sms_suffix(self):
+        with self.relay_mock(status=204) as relay_requests:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "VAPI_WEBHOOK_SECRET": "",
+                    "VAPI_RELAY_URL": "",
+                    "RELAY_URL": "https://public-pa.example/webhooks/twilio/sms",
+                },
+                clear=False,
+            ):
+                response, _ = self.request(
+                    "POST",
+                    "/vapi/events",
+                    b'{"type":"event"}',
+                    {"Content-Type": "application/json", "Authorization": f"Bearer {AUTH_TOKEN}"},
+                )
+
+        self.assertEqual(response.status, 204)
+        self.assertEqual(len(relay_requests), 1)
+        self.assertEqual(relay_requests[0]["url"], "https://public-pa.example/webhooks/vapi/events")
+
+    def test_vapi_malformed_json_returns_400_without_relay(self):
+        with self.vapi_env(), self.relay_mock() as relay_requests:
+            response, data = self.request(
+                "POST",
+                "/vapi/events",
+                b'{"type":',
+                {"Content-Type": "application/json", "x-vapi-secret": VAPI_SECRET},
+            )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(data, b'{"error":"invalid_json"}')
+        self.assertEqual(relay_requests, [])
+
+    def test_vapi_oversized_json_returns_413_without_relay(self):
+        body = b'{"type":"event"}'
+        with self.vapi_env(), self.relay_mock() as relay_requests:
+            response, data = self.request(
+                "POST",
+                "/vapi/events",
+                body,
+                {
+                    "Content-Type": "application/json",
+                    "x-vapi-secret": VAPI_SECRET,
+                    "Content-Length": str((2 * 1024 * 1024) + 1),
+                },
+            )
+
+        self.assertEqual(response.status, 413)
+        self.assertEqual(data, b'{"error":"body_too_large"}')
+        self.assertEqual(relay_requests, [])
+
+    def test_vapi_relay_failure_returns_safe_502_and_redacts_logs(self):
+        body = self.vapi_body()
+        error = urllib.error.HTTPError(VAPI_RELAY_URL, 503, "unavailable", {}, io.BytesIO(b"sensitive relay body"))
+        with self.vapi_env(), self.relay_mock(error=error):
+            response, data = self.request(
+                "POST",
+                "/vapi/events",
+                body,
+                {"Content-Type": "application/json", "x-vapi-secret": VAPI_SECRET},
+            )
+
+        self.assertEqual(response.status, 502)
+        self.assertEqual(data, b'{"error":"relay_failed"}')
+        log_text = self.stderr.getvalue()
+        self.assertIn('"event": "vapi_relay_failed"', log_text)
+        for sensitive in (
+            "sensitive transcript",
+            "+14805550123",
+            "recordings.example",
+            VAPI_SECRET,
+            "sensitive relay body",
+            "Authorization",
+            "x-vapi-secret",
+        ):
+            self.assertNotIn(sensitive, log_text)
