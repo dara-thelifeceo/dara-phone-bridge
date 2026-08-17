@@ -37,7 +37,7 @@ routing stays on Vapi.
 - `VAPI_RELAY_URL` existing OS-managed Public PA bridge endpoint for Vapi events,
   tools, or actions
 - `VAPI_RELAY_TIMEOUT_SECONDS` optional synchronous Vapi JSON relay timeout,
-  default `58`; keep below Vapi's 60-second tool server timeout
+  default `85`; keep below Vapi's 90-second tool server timeout
 - `PORT` provided by Railway, default `8080`
 
 `/health` reports booleans for Twilio, SMS relay, and Vapi events/tools/actions

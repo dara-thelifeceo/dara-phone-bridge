@@ -475,7 +475,7 @@ class VapiEventTests(BridgeTestCase):
         self.assertEqual(relay_requests[0]["url"], VAPI_TOOLS_URL)
         self.assertEqual(relay_requests[0]["body"], body)
         self.assertEqual(relay_requests[0]["vapi_secret"], VAPI_SECRET)
-        self.assertEqual(relay_requests[0]["timeout"], 58)
+        self.assertEqual(relay_requests[0]["timeout"], 85)
         events = self.assert_json_logs("vapi_relay_started", "vapi_relayed")
         started = next(event for event in events if event["event"] == "vapi_relay_started")
         self.assertEqual(started["endpoint"], "/vapi/tools")
@@ -510,7 +510,7 @@ class VapiEventTests(BridgeTestCase):
         self.assertEqual(len(relay_requests), 1)
         self.assertEqual(relay_requests[0]["url"], "https://public-pa.example/webhooks/vapi/actions")
         self.assertEqual(relay_requests[0]["vapi_secret"], AUTH_TOKEN)
-        self.assertEqual(relay_requests[0]["timeout"], 58)
+        self.assertEqual(relay_requests[0]["timeout"], 85)
 
     def test_vapi_sync_relay_timeout_is_configurable(self):
         body = b'{"call":{"id":"call_timeout_config"},"toolCalls":[{"id":"tool_timeout_config"}]}'
@@ -559,7 +559,7 @@ class VapiEventTests(BridgeTestCase):
         self.assertEqual(response.getheader("Content-Type"), "application/json")
         self.assertEqual(data, host_body)
         self.assertEqual(relay_requests[0]["url"], VAPI_RELAY_URL)
-        self.assertEqual(relay_requests[0]["timeout"], 58)
+        self.assertEqual(relay_requests[0]["timeout"], 85)
 
     def test_vapi_events_normal_async_still_returns_204_when_host_has_body(self):
         body = b'{"type":"transcript","call":{"id":"call_async"}}'
@@ -599,6 +599,27 @@ class VapiEventTests(BridgeTestCase):
         self.assertEqual(retry["call_id"], "call_retry")
         self.assertEqual(retry["tool_call_ids"], ["tool_retry"])
 
+    def test_vapi_host_relay_transient_errors_stop_after_bounded_attempts(self):
+        body = b'{"call":{"id":"call_retry_limit"},"toolCalls":[{"id":"tool_retry_limit"}]}'
+        transient_error = urllib.error.URLError("temporary outage")
+        with self.vapi_env(), self.relay_sequence([transient_error, transient_error, transient_error]) as relay_requests:
+            with mock.patch("time.sleep") as sleep_mock:
+                response, data = self.request(
+                    "POST",
+                    "/vapi/tools",
+                    body,
+                    {"Content-Type": "application/json", "x-vapi-secret": VAPI_SECRET},
+                )
+
+        self.assertEqual(response.status, 502)
+        self.assertEqual(data, b'{"error":"relay_failed"}')
+        self.assertEqual(len(relay_requests), 3)
+        self.assertEqual([request["timeout"] for request in relay_requests], [85, 85, 85])
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [0.2, 0.4])
+        events = self.assert_json_logs("vapi_relay_retry", "vapi_relay_failed")
+        retries = [event for event in events if event["event"] == "vapi_relay_retry"]
+        self.assertEqual([event["attempt"] for event in retries], [1, 2])
+
     def test_vapi_sync_relay_timeout_is_not_retried(self):
         body = b'{"call":{"id":"call_timeout"},"toolCalls":[{"id":"tool_timeout"}]}'
         timeout_error = urllib.error.URLError(socket.timeout("timed out"))
@@ -614,7 +635,7 @@ class VapiEventTests(BridgeTestCase):
         self.assertEqual(response.status, 502)
         self.assertEqual(data, b'{"error":"relay_failed"}')
         self.assertEqual(len(relay_requests), 1)
-        self.assertEqual(relay_requests[0]["timeout"], 58)
+        self.assertEqual(relay_requests[0]["timeout"], 85)
         sleep_mock.assert_not_called()
         events = self.assert_json_logs("vapi_relay_failed")
         self.assertFalse(any(event.get("event") == "vapi_relay_retry" for event in events))
