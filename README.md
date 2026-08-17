@@ -36,6 +36,8 @@ routing stays on Vapi.
 - `VAPI_WEBHOOK_SECRET` shared Vapi event webhook secret
 - `VAPI_RELAY_URL` existing OS-managed Public PA bridge endpoint for Vapi events,
   tools, or actions
+- `VAPI_RELAY_TIMEOUT_SECONDS` optional synchronous Vapi JSON relay timeout,
+  default `58`; keep below Vapi's 60-second tool server timeout
 - `PORT` provided by Railway, default `8080`
 
 `/health` reports booleans for Twilio, SMS relay, and Vapi events/tools/actions
@@ -94,7 +96,12 @@ Send the shared secret as either `x-vapi-secret` or `Authorization: Bearer ...`.
   response instead of forcing `204`.
 - Vapi `/vapi/tools` and `/vapi/actions` relay synchronously and return the
   exact host JSON status, body, and content type to Vapi.
+- Synchronous Vapi JSON relays use `VAPI_RELAY_TIMEOUT_SECONDS`; Twilio SMS and
+  async Vapi event relays keep the 8-second relay timeout.
 - Vapi host relay uses bounded transient retries with exponential backoff.
+- Vapi relay timeouts are not retried after the configured timeout budget is
+  consumed; quick transient HTTP 408/429/5xx errors and immediate connection
+  failures may still retry within the bounded retry policy.
 - Vapi auth, validation, and relay failures return safe `4xx` or `5xx` JSON errors.
 - Logs are structured JSON and avoid request bodies, headers, secrets, message
   content, transcripts, phone numbers, and recording URLs. Vapi relay logs

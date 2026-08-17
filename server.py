@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -24,6 +25,7 @@ from typing import Any
 PORT = int(os.environ.get("PORT", "8080"))
 DEFAULT_PUBLIC_HOST = "https://phone.dallasclounch.com"
 RELAY_TIMEOUT_SECONDS = 8
+DEFAULT_VAPI_RELAY_TIMEOUT_SECONDS = 58
 MAX_VAPI_BODY_BYTES = 2 * 1024 * 1024
 VAPI_RELAY_ATTEMPTS = 3
 VAPI_RELAY_BACKOFF_SECONDS = 0.2
@@ -46,6 +48,17 @@ def _public_host() -> str:
 
 def _vapi_webhook_secret() -> str:
     return _env("VAPI_WEBHOOK_SECRET") or _env("TWILIO_AUTH_TOKEN")
+
+
+def _vapi_relay_timeout_seconds() -> float:
+    raw_timeout = _env("VAPI_RELAY_TIMEOUT_SECONDS", str(DEFAULT_VAPI_RELAY_TIMEOUT_SECONDS))
+    try:
+        timeout = float(raw_timeout)
+    except ValueError:
+        return DEFAULT_VAPI_RELAY_TIMEOUT_SECONDS
+    if timeout <= 0:
+        return DEFAULT_VAPI_RELAY_TIMEOUT_SECONDS
+    return timeout
 
 
 def _replace_path_suffix(url: str, suffixes: tuple[str, ...], target_path: str) -> str:
@@ -152,7 +165,7 @@ def _relay_form_status(url: str, raw_body: bytes, signature: str, content_type: 
     return status
 
 
-def _relay_json_once(url: str, raw_body: bytes, secret: str) -> tuple[int, bytes, str]:
+def _relay_json_once(url: str, raw_body: bytes, secret: str, timeout: float) -> tuple[int, bytes, str]:
     req = urllib.request.Request(
         url,
         data=raw_body,
@@ -163,22 +176,40 @@ def _relay_json_once(url: str, raw_body: bytes, secret: str) -> tuple[int, bytes
             "User-Agent": "dara-phone-bridge/2.0",
         },
     )
-    with urllib.request.urlopen(req, timeout=RELAY_TIMEOUT_SECONDS) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         response_body = response.read()
         return response.status, response_body, response.headers.get("Content-Type", "application/json")
 
 
+def _is_relay_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return True
+    return False
+
+
 def _is_transient_relay_error(exc: BaseException) -> bool:
+    if _is_relay_timeout_error(exc):
+        return False
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in {408, 429, 500, 502, 503, 504}
     return isinstance(exc, (TimeoutError, urllib.error.URLError))
 
 
-def _relay_json(url: str, raw_body: bytes, secret: str, log_fields: dict[str, Any]) -> tuple[int, bytes, str]:
+def _relay_json(
+    url: str,
+    raw_body: bytes,
+    secret: str,
+    log_fields: dict[str, Any],
+    timeout: float = RELAY_TIMEOUT_SECONDS,
+) -> tuple[int, bytes, str]:
     attempts = VAPI_RELAY_ATTEMPTS
     for attempt in range(1, attempts + 1):
         try:
-            return _relay_json_once(url, raw_body, secret)
+            return _relay_json_once(url, raw_body, secret, timeout)
         except urllib.error.HTTPError as exc:
             if not _is_transient_relay_error(exc) or attempt == attempts:
                 body = exc.read()
@@ -463,10 +494,17 @@ class Handler(BaseHTTPRequestHandler):
         sync_endpoint = path in VAPI_SYNC_PATHS
         tool_calls_event = path == VAPI_EVENTS_PATH and _is_tool_calls_envelope(payload)
         sync_response = sync_endpoint or tool_calls_event
+        relay_timeout = _vapi_relay_timeout_seconds() if sync_response else RELAY_TIMEOUT_SECONDS
         _json_log("vapi_relay_started", **log_fields)
 
         try:
-            status, body, response_content_type = _relay_json(relay_url, raw_body or b"", webhook_secret, log_fields)
+            status, body, response_content_type = _relay_json(
+                relay_url,
+                raw_body or b"",
+                webhook_secret,
+                log_fields,
+                timeout=relay_timeout,
+            )
         except Exception as exc:  # noqa: BLE001
             _json_log("vapi_relay_failed", error=type(exc).__name__, **log_fields)
             self._send(502, b'{"error":"relay_failed"}')

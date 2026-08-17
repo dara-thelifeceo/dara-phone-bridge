@@ -7,6 +7,7 @@ import importlib
 import io
 import json
 import os
+import socket
 import unittest
 import urllib.parse
 import urllib.error
@@ -268,7 +269,7 @@ class SmsBridgeTests(BridgeTestCase):
         self.assertEqual(relay_requests[0]["body"], body)
         self.assertEqual(relay_requests[0]["signature"], sig)
         self.assertEqual(relay_requests[0]["content_type"], "application/x-www-form-urlencoded")
-        self.assertLessEqual(relay_requests[0]["timeout"], 10)
+        self.assertEqual(relay_requests[0]["timeout"], 8)
         events = self.assert_json_logs("sms_accepted", "sms_relayed")
         self.assertNotIn("hello Dara", "\n".join(json.dumps(event) for event in events))
 
@@ -448,7 +449,7 @@ class VapiEventTests(BridgeTestCase):
         self.assertEqual(relay_requests[0]["body"], body)
         self.assertEqual(relay_requests[0]["content_type"], "application/json")
         self.assertEqual(relay_requests[0]["vapi_secret"], VAPI_SECRET)
-        self.assertLessEqual(relay_requests[0]["timeout"], 10)
+        self.assertEqual(relay_requests[0]["timeout"], 8)
 
     def test_vapi_tools_returns_exact_host_json_status_body_content_type(self):
         body = json.dumps(
@@ -474,6 +475,7 @@ class VapiEventTests(BridgeTestCase):
         self.assertEqual(relay_requests[0]["url"], VAPI_TOOLS_URL)
         self.assertEqual(relay_requests[0]["body"], body)
         self.assertEqual(relay_requests[0]["vapi_secret"], VAPI_SECRET)
+        self.assertEqual(relay_requests[0]["timeout"], 58)
         events = self.assert_json_logs("vapi_relay_started", "vapi_relayed")
         started = next(event for event in events if event["event"] == "vapi_relay_started")
         self.assertEqual(started["endpoint"], "/vapi/tools")
@@ -508,6 +510,23 @@ class VapiEventTests(BridgeTestCase):
         self.assertEqual(len(relay_requests), 1)
         self.assertEqual(relay_requests[0]["url"], "https://public-pa.example/webhooks/vapi/actions")
         self.assertEqual(relay_requests[0]["vapi_secret"], AUTH_TOKEN)
+        self.assertEqual(relay_requests[0]["timeout"], 58)
+
+    def test_vapi_sync_relay_timeout_is_configurable(self):
+        body = b'{"call":{"id":"call_timeout_config"},"toolCalls":[{"id":"tool_timeout_config"}]}'
+        with self.vapi_env(), self.relay_mock(status=200, body=b'{"ok":true}', content_type="application/json") as relay_requests:
+            with mock.patch.dict(os.environ, {"VAPI_RELAY_TIMEOUT_SECONDS": "42"}, clear=False):
+                response, data = self.request(
+                    "POST",
+                    "/vapi/tools",
+                    body,
+                    {"Content-Type": "application/json", "x-vapi-secret": VAPI_SECRET},
+                )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(data, b'{"ok":true}')
+        self.assertEqual(len(relay_requests), 1)
+        self.assertEqual(relay_requests[0]["timeout"], 42.0)
 
     def test_vapi_sync_host_http_error_status_and_json_body_are_passthrough(self):
         body = b'{"call":{"id":"call_bad"},"toolCalls":[{"id":"tool_bad"}]}'
@@ -540,6 +559,7 @@ class VapiEventTests(BridgeTestCase):
         self.assertEqual(response.getheader("Content-Type"), "application/json")
         self.assertEqual(data, host_body)
         self.assertEqual(relay_requests[0]["url"], VAPI_RELAY_URL)
+        self.assertEqual(relay_requests[0]["timeout"], 58)
 
     def test_vapi_events_normal_async_still_returns_204_when_host_has_body(self):
         body = b'{"type":"transcript","call":{"id":"call_async"}}'
@@ -578,6 +598,26 @@ class VapiEventTests(BridgeTestCase):
         retry = next(event for event in events if event["event"] == "vapi_relay_retry")
         self.assertEqual(retry["call_id"], "call_retry")
         self.assertEqual(retry["tool_call_ids"], ["tool_retry"])
+
+    def test_vapi_sync_relay_timeout_is_not_retried(self):
+        body = b'{"call":{"id":"call_timeout"},"toolCalls":[{"id":"tool_timeout"}]}'
+        timeout_error = urllib.error.URLError(socket.timeout("timed out"))
+        with self.vapi_env(), self.relay_sequence([timeout_error]) as relay_requests:
+            with mock.patch("time.sleep") as sleep_mock:
+                response, data = self.request(
+                    "POST",
+                    "/vapi/tools",
+                    body,
+                    {"Content-Type": "application/json", "x-vapi-secret": VAPI_SECRET},
+                )
+
+        self.assertEqual(response.status, 502)
+        self.assertEqual(data, b'{"error":"relay_failed"}')
+        self.assertEqual(len(relay_requests), 1)
+        self.assertEqual(relay_requests[0]["timeout"], 58)
+        sleep_mock.assert_not_called()
+        events = self.assert_json_logs("vapi_relay_failed")
+        self.assertFalse(any(event.get("event") == "vapi_relay_retry" for event in events))
 
     def test_vapi_valid_bearer_secret_relays(self):
         with self.vapi_env(), self.relay_mock(status=204) as relay_requests:
